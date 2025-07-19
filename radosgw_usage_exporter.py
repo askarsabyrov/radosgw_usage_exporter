@@ -8,6 +8,7 @@ import logging
 import json
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from awsauth import S3Auth
 from prometheus_client import start_http_server
 from collections import defaultdict, Counter
@@ -72,12 +73,18 @@ class RADOSGWCollector(object):
             self._update_usage_metrics()
 
         if rgw_bucket:
-            for bucket in rgw_bucket:
-                self._get_bucket_usage(bucket)
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                # Use ThreadPoolExecutor to parallelize bucket usage requests
+                futures = [executor.submit(self._get_bucket_usage, bucket) for bucket in rgw_bucket]
+                for future in futures:
+                    future.result()
 
         if rgw_users:
-            for user in rgw_users:
-                self._get_user_info(user)
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                # Use ThreadPoolExecutor to parallelize user info requests
+                futures = [executor.submit(self._get_user_info, user["user"]) for user in rgw_users]
+                for future in futures:
+                    future.result()
 
         duration = time.time() - start
         self._prometheus_metrics["scrape_duration_seconds"].add_metric([], duration)
