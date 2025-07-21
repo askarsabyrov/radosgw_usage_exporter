@@ -83,7 +83,7 @@ class RADOSGWCollector(object):
         if rgw_users:
             with ThreadPoolExecutor(max_workers=20) as executor:
                 # Use ThreadPoolExecutor to parallelize user info requests
-                futures = [executor.submit(self._get_user_info, user["user"]) for user in rgw_users]
+                futures = [executor.submit(self._get_user_info, user) for user in rgw_users]
                 for future in futures:
                     future.result()
 
