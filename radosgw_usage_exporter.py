@@ -65,6 +65,7 @@ class RADOSGWCollector(object):
         rgw_usage = self._request_data(query="usage", args="show-summary=False")
         rgw_bucket = self._request_data(query="bucket", args="stats=True")
         rgw_users = self._get_rgw_users()
+        print("rgw_users: {0}".format(rgw_users))
 
         # populate metrics with data
         if rgw_usage:
