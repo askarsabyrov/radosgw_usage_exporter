@@ -8,6 +8,7 @@ import logging
 import json
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from awsauth import S3Auth
 from prometheus_client import start_http_server
 from collections import defaultdict, Counter
@@ -61,23 +62,23 @@ class RADOSGWCollector(object):
         # setup dict for aggregating bucket usage accross "bins"
         self.usage_dict = defaultdict(dict)
 
-        rgw_usage = self._request_data(query="usage", args="show-summary=False")
-        rgw_bucket = self._request_data(query="bucket", args="stats=True")
+        rgw_buckets = self._get_rgw_buckets()
+        print("rgw_buckets: {0}".format(rgw_buckets))
         rgw_users = self._get_rgw_users()
 
-        # populate metrics with data
-        if rgw_usage:
-            for entry in rgw_usage["entries"]:
-                self._get_usage(entry)
-            self._update_usage_metrics()
-
-        if rgw_bucket:
-            for bucket in rgw_bucket:
-                self._get_bucket_usage(bucket)
+        if rgw_buckets:
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                # Use ThreadPoolExecutor to parallelize bucket usage requests
+                futures = [executor.submit(self._get_bucket_usage, bucket) for bucket in rgw_buckets]
+                for future in futures:
+                    future.result()
 
         if rgw_users:
-            for user in rgw_users:
-                self._get_user_info(user)
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                # Use ThreadPoolExecutor to parallelize user info requests
+                futures = [executor.submit(self._get_user_info, user) for user in rgw_users]
+                for future in futures:
+                    future.result()
 
         duration = time.time() - start
         self._prometheus_metrics["scrape_duration_seconds"].add_metric([], duration)
@@ -347,6 +348,7 @@ class RADOSGWCollector(object):
         Method get actual bucket usage (in bytes).
         Some skips and adjustments for various Ceph releases.
         """
+        bucket = self._request_data(query="bucket", args="stats=True&bucket={0}".format(bucket))
         logging.debug((json.dumps(bucket, indent=4, sort_keys=True)))
 
         if type(bucket) is dict:
@@ -449,6 +451,12 @@ class RADOSGWCollector(object):
             return rgw_metadata_users
 
         return
+    
+    def _get_rgw_buckets(self):
+        """
+        API request to get buckets.
+        """
+        return self._request_data(query="bucket", args="list")
 
     def _get_user_info(self, user):
         """
