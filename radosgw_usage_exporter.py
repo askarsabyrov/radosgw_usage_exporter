@@ -25,7 +25,7 @@ class RADOSGWCollector(object):
     of ceph.conf see Ceph documentation for details"""
 
     def __init__(
-        self, host, admin_entry, access_key, secret_key, store, insecure, timeout, tag_list
+        self, host, admin_entry, access_key, secret_key, store, insecure, timeout, tag_list, pool_size, retries
     ):
         super(RADOSGWCollector, self).__init__()
         self.host = host
@@ -35,6 +35,8 @@ class RADOSGWCollector(object):
         self.insecure = insecure
         self.timeout = timeout
         self.tag_list = tag_list
+        self.pool_size = pool_size
+        self.retries = retries
 
         # helpers for default schema
         if not self.host.startswith("http"):
@@ -48,54 +50,49 @@ class RADOSGWCollector(object):
         self._session()
 
     def collect(self):
-        """
-        * Collect 'usage' data:
-            http://docs.ceph.com/docs/master/radosgw/adminops/#get-usage
-        * Collect 'bucket' data:
-            http://docs.ceph.com/docs/master/radosgw/adminops/#get-bucket-info
-        """
-
+        logging.info("Starting metrics scrape...")
         start = time.time()
-        # setup empty prometheus metrics
         self._setup_empty_prometheus_metrics(args="")
-
-        # setup dict for aggregating bucket usage accross "bins"
         self.usage_dict = defaultdict(dict)
-
+        logging.debug("Fetching bucket list from RADOSGW...")
         rgw_buckets = self._get_rgw_buckets()
-        print("rgw_buckets: {0}".format(rgw_buckets))
+        logging.info(f"Fetched {len(rgw_buckets) if rgw_buckets else 0} buckets.")
+        logging.debug("Fetching user list from RADOSGW...")
         rgw_users = self._get_rgw_users()
-
+        logging.info(f"Fetched {len(rgw_users) if rgw_users else 0} users.")
         if rgw_buckets:
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            logging.debug("Processing bucket usage in parallel...")
+            with ThreadPoolExecutor(max_workers=self.pool_size) as executor:
                 # Use ThreadPoolExecutor to parallelize bucket usage requests
                 futures = [executor.submit(self._get_bucket_usage, bucket) for bucket in rgw_buckets]
                 for future in futures:
                     future.result()
-
         if rgw_users:
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            logging.debug("Processing user info in parallel...")
+            with ThreadPoolExecutor(max_workers=self.pool_size) as executor:
                 # Use ThreadPoolExecutor to parallelize user info requests
                 futures = [executor.submit(self._get_user_info, user) for user in rgw_users]
                 for future in futures:
                     future.result()
-
         duration = time.time() - start
+        logging.info(f"Metrics scrape finished in {duration:.2f} seconds.")
         self._prometheus_metrics["scrape_duration_seconds"].add_metric([], duration)
 
         for metric in list(self._prometheus_metrics.values()):
             yield metric
 
     def _session(self):
+        logging.debug(f"Setting up HTTP session with pool size {self.pool_size}...")
         """
         Setup Requests connection settings.
         """
         self.session = requests.Session()
         self.session_adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10, pool_maxsize=10
+            pool_connections=self.pool_size, pool_maxsize=self.pool_size
         )
         self.session.mount("http://", self.session_adapter)
         self.session.mount("https://", self.session_adapter)
+        logging.debug("HTTP session setup complete.")
 
         # Inversion of condition, when '--insecure' is defined we disable
         # requests warning about certificate hostname mismatch.
@@ -104,38 +101,33 @@ class RADOSGWCollector(object):
         logging.debug("Perform insecured requests")
 
     def _request_data(self, query, args):
-        """
-        Requests data from RGW. If admin entry and caps is fine - return
-        JSON data, otherwise return NoneType.
-        """
         url = "{0}{1}/?format=json&{2}".format(self.url, query, args)
-
-        try:
-            response = self.session.get(
-                url,
-                verify=self.insecure,
-                timeout=float(self.timeout),
-                auth=S3Auth(self.access_key, self.secret_key, self.host),
-            )
-
-            if response.status_code == requests.codes.ok:
-                logging.debug(response)
-                return response.json()
-            else:
-                # Usage caps absent or wrong admin entry
-                logging.error(
-                    (
-                        "Request error [{0}]: {1}".format(
-                            response.status_code, response.content.decode("utf-8")
+        logging.debug(f"Requesting URL: {url}")
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    verify=self.insecure,
+                    timeout=float(self.timeout),
+                    auth=S3Auth(self.access_key, self.secret_key, self.host),
+                )
+                logging.debug(f"Response status: {response.status_code}")
+                if response.status_code == requests.codes.ok:
+                    logging.debug(f"Response OK: {response.text[:200]}...")
+                    return response.json()
+                else:
+                    logging.error(
+                        (
+                            f"Request error [{response.status_code}]: {response.content.decode('utf-8')} (Attempt {attempt}/{self.retries})"
                         )
                     )
-                )
-                return
-
-        # DNS, connection errors, etc
-        except requests.exceptions.RequestException as e:
-            logging.info(("Request error: {0}".format(e)))
-            return
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request failed: {e} (Attempt {attempt}/{self.retries})")
+            if attempt < self.retries:
+                logging.info(f"Retrying request (Attempt {attempt + 1}/{self.retries})...")
+                time.sleep(2)  # simple backoff
+        logging.error(f"All {self.retries} attempts failed for URL: {url}")
+        return None
 
     def _setup_empty_prometheus_metrics(self, args):
         """
@@ -599,6 +591,20 @@ def parse_args():
         help="Add bucket tags as label (example: 'tag1,tag2,tag3') ",
         default=os.environ.get("TAG_LIST", ""),
     )
+    parser.add_argument(
+        "--pool-size",
+        required=False,
+        type=int,
+        help="Number of connections in pool and max workers for threads",
+        default=int(os.environ.get("POOL_SIZE", "40")),
+    )
+    parser.add_argument(
+        "--retries",
+        required=False,
+        type=int,
+        help="Number of retries for failed HTTP requests",
+        default=int(os.environ.get("RETRIES", "3")),
+    )
 
     return parser.parse_args()
 
@@ -617,6 +623,8 @@ def main():
                 args.insecure,
                 args.timeout,
                 args.tag_list,
+                args.pool_size,
+                args.retries,
             )
         )
         start_http_server(args.port, addr="::")
