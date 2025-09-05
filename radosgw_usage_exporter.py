@@ -13,6 +13,7 @@ from awsauth import S3Auth
 from prometheus_client import start_http_server
 from collections import defaultdict, Counter
 from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily, REGISTRY
+import threading
 
 
 class RADOSGWCollector(object):
@@ -49,7 +50,40 @@ class RADOSGWCollector(object):
         # Prepare Requests Session
         self._session()
 
+        self._cache_lock = threading.Lock()
+        self._cache_metrics = None
+        self._cache_timestamp = 0
+        self._cache_interval = 300  # 5 minutes in seconds
+        self._start_cache_updater()
+
+    def _start_cache_updater(self):
+        def update_cache_periodically():
+            while True:
+                metrics = list(self._collect_metrics())
+                with self._cache_lock:
+                    self._cache_metrics = metrics
+                    self._cache_timestamp = time.time()
+                time.sleep(self._cache_interval)
+        t = threading.Thread(target=update_cache_periodically, daemon=True)
+        t.start()
+
     def collect(self):
+        with self._cache_lock:
+            if self._cache_metrics is not None:
+                logging.debug("Serving metrics from cache.")
+                for metric in self._cache_metrics:
+                    yield metric
+                return
+        # If cache is empty (first run), collect synchronously
+        logging.info("Cache empty, collecting metrics synchronously.")
+        metrics = list(self._collect_metrics())
+        with self._cache_lock:
+            self._cache_metrics = metrics
+            self._cache_timestamp = time.time()
+        for metric in metrics:
+            yield metric
+
+    def _collect_metrics(self):
         logging.info("Starting metrics scrape...")
         start = time.time()
         self._setup_empty_prometheus_metrics(args="")
